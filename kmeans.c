@@ -16,6 +16,9 @@ double *sum_global;
 int global_flips = 0;
 int k_global;
 
+int max_iteracoes = 1000; //garantir a convergência
+int global_iteracao = 0;
+
 // Dados de entrada
 double *x_global;
 double *mean_global;
@@ -103,6 +106,7 @@ void *worker_fn(void *arg) {
                 sum_global[c*DIM+2] = 0.0;
             }
             global_flips = 0;
+            global_iteracao++;
         }
 
         barreira(nthreads_global);
@@ -134,7 +138,7 @@ void *worker_fn(void *arg) {
 
         barreira(nthreads_global);
 
-        if (global_flips == 0) break;
+        if (global_flips == 0 || global_iteracao >= max_iteracoes) break;
     }
 
     pthread_exit(NULL);

@@ -1,8 +1,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
 
 #define DIM 3
+int max_iteracoes = 1000; //garantir a convergência
+int global_iteracao = 0;
+
+clock_t start, end;
+double tempo_execucao;
 
 // A função main agora aceita argumentos de linha de comando
 int main(int argc, char *argv[]) {
@@ -87,9 +93,10 @@ int main(int argc, char *argv[]) {
     // Fecha o arquivo após a leitura
     fclose(arquivo_pontos);
 
+    start = clock();
     // --- 7. Lógica K-Means (Inalterada) ---
     flips = n;
-    while (flips>0) {
+    while (flips>0 && global_iteracao < max_iteracoes) {
         flips = 0;
         for (j = 0; j < k; j++) {
             count[j] = 0; 
@@ -126,7 +133,10 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
+        global_iteracao++;
     }
+    end = clock();
+    tempo_execucao = ((double)(end - start)) / CLOCKS_PER_SEC;
 
     // --- 8. Impressão dos Resultados (Inalterada) ---
     printf("\nCentroides finais:\n");
@@ -135,6 +145,8 @@ int main(int argc, char *argv[]) {
             printf("%5.2f ", mean[i*DIM+j]);
         printf("\n");
     }
+
+    printf("Tempo de execucao sequencial: %.6f segundos\n", tempo_execucao);
 
     #ifdef DEBUG
     for (i = 0; i < n; i++) {
