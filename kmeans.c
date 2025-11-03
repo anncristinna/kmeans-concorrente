@@ -6,7 +6,6 @@
 
 #define DIM 3
 
-// --- Variáveis Globais ---
 pthread_mutex_t mutex;
 pthread_cond_t cond;
 int nthreads_global;
@@ -16,9 +15,9 @@ int *count_global;
 double *sum_global;
 int global_flips = 0;
 int k_global;
-
-int max_iteracoes = 1000; // Limite de iterações
-int global_iteracao = 0;  // Contador de iterações
+int max_iteracoes = 1000;
+int global_iteracao = 0;
+volatile int convergiu = 0;
 
 // Dados de entrada
 double *x_global;
@@ -26,7 +25,6 @@ double *mean_global;
 int *cluster_global;
 int n_global;
 
-// Estrutura do Worker (Thread)
 typedef struct {
     int tid;
     int *count_local;
@@ -34,11 +32,8 @@ typedef struct {
     int flips_local;
 } Worker;
 
-// Ponteiro global para os dados dos workers
-// (Necessário para a thread 0 agregar os dados)
-Worker *wk_global; 
+Worker *wk_global;
 
-// --- Função de Barreira (Inalterada) ---
 void barreira(int nthreads) {
     static int bloqueadas = 0;
     pthread_mutex_lock(&mutex);
@@ -52,7 +47,6 @@ void barreira(int nthreads) {
     pthread_mutex_unlock(&mutex);
 }
 
-// --- Função de Distância (Inalterada) ---
 static inline double dist2_3d(const double *a, const double *b) {
     double dx = a[0] - b[0];
     double dy = a[1] - b[1];
@@ -60,39 +54,28 @@ static inline double dist2_3d(const double *a, const double *b) {
     return dx*dx + dy*dy + dz*dz;
 }
 
-// #################################################################
-// ### FUNÇÃO WORKER (PRINCIPAIS ALTERAÇÕES AQUI) ###
-// #################################################################
 void *worker_fn(void *arg) {
-    Worker *w = (Worker *)arg; // Pega os dados *desta* thread
+    Worker *w = (Worker *)arg;
     int tid = w->tid;
 
-    // Divisão do trabalho (inalterado)
     int n_per_thread = (n_global + nthreads_global - 1) / nthreads_global;
     int start = tid * n_per_thread;
     int end = start + n_per_thread;
     if (end > n_global) end = n_global;
 
-    // Loop principal do K-Means
     for (;;) {
-        // 1. ZERAR ACUMULADORES LOCAIS (Paralelo)
-        // (Toda thread zera seus próprios dados)
         for (int c = 0; c < k_global; c++) {
             w->count_local[c] = 0;
-            w->sum_local[c*DIM+0] = 0.0;
-            w->sum_local[c*DIM+1] = 0.0;
-            w->sum_local[c*DIM+2] = 0.0;
+            for (int d = 0; d < DIM; d++)
+                w->sum_local[c*DIM + d] = 0.0;
         }
         w->flips_local = 0;
 
-        // 2. CALCULAR DISTÂNCIAS E ATRIBUIR CLUSTERS (Paralelo)
-        // (Toda thread processa sua fatia de pontos)
         for (int i = start; i < end; i++) {
             const double *xi = &x_global[i * DIM];
             int old_c = cluster_global[i];
             double best = INFINITY;
             int best_c = 0;
-
             for (int c = 0; c < k_global; c++) {
                 double d2 = dist2_3d(xi, &mean_global[c * DIM]);
                 if (d2 < best) {
@@ -100,227 +83,165 @@ void *worker_fn(void *arg) {
                     best_c = c;
                 }
             }
-
             if (best_c != old_c) {
                 cluster_global[i] = best_c;
                 w->flips_local++;
             }
-
-            // Acumula nos dados LOCAIS
             w->count_local[best_c]++;
-            double *s = &w->sum_local[best_c * DIM];
-            s[0] += xi[0];
-            s[1] += xi[1];
-            s[2] += xi[2];
+            for (int d = 0; d < DIM; d++)
+                w->sum_local[best_c*DIM + d] += xi[d];
         }
 
-        // 3. PRIMEIRA BARREIRA
-        // (Todas as threads esperam aqui. Garante que o cálculo
-        // paralelo terminou antes da agregação serial)
         barreira(nthreads_global);
 
-        // 4. TRABALHO SERIAL (Agregação e Recálculo)
-        // (Apenas a Thread 0 faz isso. SEM MUTEX DE CONTENÇÃO)
-        if (tid == 0) {
-            // Zera os contadores globais
-            global_flips = 0;
-            global_iteracao++;
-            for (int c = 0; c < k_global; c++) {
-                count_global[c] = 0;
-                sum_global[c*DIM+0] = 0.0;
-                sum_global[c*DIM+1] = 0.0;
-                sum_global[c*DIM+2] = 0.0;
-            }
+        int clusters_por_thread = (k_global + nthreads_global - 1) / nthreads_global;
+        int c_start = tid * clusters_por_thread;
+        int c_end = c_start + clusters_por_thread;
+        if (c_end > k_global) c_end = k_global;
 
-            // Agrega os resultados de TODAS as threads
+        for (int c = c_start; c < c_end; c++) {
+            int count = 0;
+            double sum[DIM] = {0};
             for (int t = 0; t < nthreads_global; t++) {
-                global_flips += wk_global[t].flips_local;
-                for (int c = 0; c < k_global; c++) {
-                    count_global[c] += wk_global[t].count_local[c];
-                    double *sg = &sum_global[c * DIM];
-                    double *sl = &wk_global[t].sum_local[c * DIM];
-                    sg[0] += sl[0];
-                    sg[1] += sl[1];
-                    sg[2] += sl[2];
-                }
+                count += wk_global[t].count_local[c];
+                for (int d = 0; d < DIM; d++)
+                    sum[d] += wk_global[t].sum_local[c*DIM + d];
             }
+            count_global[c] = count;
+            for (int d = 0; d < DIM; d++)
+                sum_global[c*DIM + d] = sum[d];
+        }
 
-            // Recalcula as médias globais
-            for (int c = 0; c < k_global; c++) {
-                if (count_global[c] > 0) {
-                    double inv = 1.0 / count_global[c];
-                    mean_global[c*DIM + 0] = sum_global[c*DIM + 0] * inv;
-                    mean_global[c*DIM + 1] = sum_global[c*DIM + 1] * inv;
-                    mean_global[c*DIM + 2] = sum_global[c*DIM + 2] * inv;
-                }
-            }
-        } // Fim do if(tid == 0)
-
-        // 5. SEGUNDA BARREIRA
-        // (Garante que a thread 0 terminou de calcular as
-        // novas médias ANTES das outras threads as usarem)
         barreira(nthreads_global);
 
-        // 6. CHECAGEM DE PARADA (Paralelo)
-        // (Todas as threads leem as variáveis globais e decidem se param)
-        if (global_flips == 0 || global_iteracao >= max_iteracoes) {
-            break;
+        // Recalcular centróides
+        for (int c = c_start; c < c_end; c++) {
+            if (count_global[c] > 0) {
+                double inv = 1.0 / count_global[c];
+                for (int d = 0; d < DIM; d++)
+                    mean_global[c*DIM + d] = sum_global[c*DIM + d] * inv;
+            }
         }
-    } // Fim do for(;;)
+
+        barreira(nthreads_global);
+
+        if (tid == 0) {
+            global_iteracao++;
+            global_flips = 0;
+            for (int t = 0; t < nthreads_global; t++)
+                global_flips += wk_global[t].flips_local;
+            convergiu = (global_flips == 0 || global_iteracao >= max_iteracoes);
+        }
+
+        barreira(nthreads_global);
+
+        if (convergiu) break;
+    }
 
     pthread_exit(NULL);
 }
-// #################################################################
-// ### FIM DA FUNÇÃO WORKER ###
-// #################################################################
-
 
 int main(int argc, char **argv) {
     int k, n;
-    FILE *arquivo_entrada; 
+    FILE *arquivo_entrada;
 
-    // --- 1. Checagem de argumentos (inalterado) ---
     if (argc < 2) {
-        fprintf(stderr, "Erro: informe o arquivo de entrada.\n");
         fprintf(stderr, "Uso: %s <arquivo_pontos>\n", argv[0]);
         return 1;
     }
 
-    // --- 2. Pedir parâmetros interativamente (inalterado) ---
     printf("Digite o numero de threads: ");
-    if (scanf("%d", &nthreads_global) != 1 || nthreads_global <= 0) {
-        fprintf(stderr, "Numero de threads invalido\n");
-        return 1;
-    }
+    scanf("%d", &nthreads_global);
     printf("Digite o numero de clusters (k): ");
-    if (scanf("%d", &k) != 1 || k <= 0) {
-        fprintf(stderr, "Entrada invalida para k.\n");
-        return 1;
-    }
+    scanf("%d", &k);
     k_global = k;
     printf("Digite o numero de pontos (n): ");
-    if (scanf("%d", &n) != 1 || n <= 0) {
-        fprintf(stderr, "Entrada invalida para n.\n");
-        return 1;
-    }
+    scanf("%d", &n);
     n_global = n;
     if (k_global > n_global) {
-        fprintf(stderr, "Erro: O numero de clusters (k=%d) nao pode ser maior que o numero de pontos (n=%d).\n", k_global, n_global);
+        fprintf(stderr, "Erro: k > n.\n");
         return 1;
     }
 
-    // --- 3. Abrir arquivo (inalterado) ---
     arquivo_entrada = fopen(argv[1], "r");
-    if (arquivo_entrada == NULL) {
-        perror("Erro ao abrir o arquivo de entrada");
+    if (!arquivo_entrada) {
+        perror("Erro ao abrir arquivo");
         return 1;
     }
 
-    // --- 4. Alocações (inalterado) ---
     x_global = malloc(sizeof(double) * DIM * n);
     mean_global = malloc(sizeof(double) * DIM * k);
     cluster_global = malloc(sizeof(int) * n);
-    if (!x_global || !mean_global || !cluster_global) {
-        fprintf(stderr, "Erro de alocacao\n");
-        fclose(arquivo_entrada);
-        return 1;
-    }
 
-    // --- 5. Pedir centróides iniciais (inalterado) ---
     printf("\nDigite as coordenadas iniciais dos %d centroides (X Y Z):\n", k_global);
     for (int i = 0; i < k_global; i++) {
         printf("Centroide %d: ", i);
-        if (scanf("%lf %lf %lf",
-                  &mean_global[i*DIM],
-                  &mean_global[i*DIM+1],
-                  &mean_global[i*DIM+2]) != 3) {
-            fprintf(stderr, "Erro na leitura das coordenadas do centroide.\n");
-            fclose(arquivo_entrada);
-            return 1;
-        }
+        scanf("%lf %lf %lf",
+              &mean_global[i*DIM],
+              &mean_global[i*DIM+1],
+              &mean_global[i*DIM+2]);
     }
 
-    // --- 6. Ler pontos do arquivo (inalterado) ---
-    printf("\nLendo %d pontos do arquivo '%s'...\n", n_global, argv[1]);
+    printf("\nLendo %d pontos de '%s'...\n", n_global, argv[1]);
     for (int i = 0; i < n_global; i++) {
-        if (fscanf(arquivo_entrada, "%lf %lf %lf",
-                  &x_global[i*DIM],
-                  &x_global[i*DIM+1],
-                  &x_global[i*DIM+2]) != 3) {
-            fprintf(stderr, "Erro ao ler dados do ponto %d no arquivo.\n", i);
-            fclose(arquivo_entrada);
-            return 1;
-        }
-        cluster_global[i] = 0; 
+        fscanf(arquivo_entrada, "%lf %lf %lf",
+               &x_global[i*DIM],
+               &x_global[i*DIM+1],
+               &x_global[i*DIM+2]);
+        cluster_global[i] = 0;
     }
     fclose(arquivo_entrada);
-    
-    // --- 7. Alocações restantes e inicialização ---
+
     count_global = malloc(sizeof(int) * k);
     sum_global = malloc(sizeof(double) * k * DIM);
+    wk_global = malloc(sizeof(Worker) * nthreads_global);
+    pthread_t *tid = malloc(sizeof(pthread_t) * nthreads_global);
 
     pthread_mutex_init(&mutex, NULL);
     pthread_cond_init(&cond, NULL);
 
-    pthread_t *tid = malloc(sizeof(pthread_t) * nthreads_global);
-    
-    // ############ ALTERAÇÃO AQUI ############
-    // Aloca o array global de workers
-    wk_global = malloc(sizeof(Worker) * nthreads_global);
-
-    // Aloca os dados locais para cada worker
     for (int t = 0; t < nthreads_global; t++) {
         wk_global[t].tid = t;
         wk_global[t].count_local = malloc(sizeof(int) * k);
         wk_global[t].sum_local = malloc(sizeof(double) * k * DIM);
     }
 
-    // --- 8. Execução ---
     clock_t inicio = clock();
 
-    for (int t = 0; t < nthreads_global; t++) {
-        // Passa o ponteiro para a estrutura específica desta thread
+    for (int t = 0; t < nthreads_global; t++)
         pthread_create(&tid[t], NULL, worker_fn, &wk_global[t]);
-    }
 
-    for (int t = 0; t < nthreads_global; t++) {
+    for (int t = 0; t < nthreads_global; t++)
         pthread_join(tid[t], NULL);
-    }
 
     clock_t fim = clock();
     double tempo = (double)(fim - inicio) / CLOCKS_PER_SEC;
 
-    // --- 9. Saída e Limpeza ---
-    
-    // (Opcional) Aviso de parada por iteração
-    if (global_iteracao >= max_iteracoes) {
-        printf("\nAviso: K-Means parou por atingir o limite de %d iteracoes.\n", max_iteracoes);
-    }
-    
+    if (global_iteracao >= max_iteracoes)
+        printf("\nAviso: atingiu o limite de %d iteracoes.\n", max_iteracoes);
+
     printf("\nCentroides finais:\n");
-    for (int i = 0; i < k; i++) {
+    for (int i = 0; i < k_global; i++)
         printf("Cluster %d => (%.2f, %.2f, %.2f)\n",
                i,
-               mean_global[i*DIM], mean_global[i*DIM+1], mean_global[i*DIM+2]);
-    }
-    fprintf(stderr, "\nTempo de execucao concorrente = %.6fs com %d threads\n",
+               mean_global[i*DIM],
+               mean_global[i*DIM+1],
+               mean_global[i*DIM+2]);
+
+    fprintf(stderr, "\nTempo total = %.6fs com %d threads\n",
            tempo, nthreads_global);
 
-    // Limpeza de memória
     for (int t = 0; t < nthreads_global; t++) {
         free(wk_global[t].count_local);
         free(wk_global[t].sum_local);
     }
-    
-    // ############ ALTERAÇÃO AQUI ############
-    free(wk_global); // Libera o array de workers
-    
+    free(wk_global);
     free(tid);
     free(count_global);
     free(sum_global);
     free(x_global);
     free(mean_global);
     free(cluster_global);
-    
+
     return 0;
 }
